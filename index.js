@@ -67,8 +67,8 @@ const getVideoViewCount = (videoIds, callback) => {
 					//ChannelId: body.items[0].snippet.channelId,
 					ChannelTitle: body.items[0].snippet.channelTitle,
 					ViewCount: body.items[0].statistics.viewCount,
-					LikeCount: body.items[0].statistics.likeCount,
-					DislikeCount: body.items[0].statistics.dislikeCount,
+					LikeCount: body.items[0].statistics.likeCount | 0,
+					DislikeCount: body.items[0].statistics.dislikeCount | 0,
 					Thumbnail: '=IMAGE("' + body.items[0].snippet.thumbnails.medium.url + '")'
 				};
 
