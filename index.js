@@ -1,167 +1,188 @@
 'use strict';
 
 const request = require('request');
-const async = require('async');
 const AWS = require('aws-sdk');
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 
 
-const serachVideos = (channelId, nextPageToken, callback) => {
-	console.log('search videos:', channelId);
-
+const getVideoIdsOnPage = (channelId, pageToken) => {
 	let uri = 'https://www.googleapis.com/youtube/v3/search?channelId=' + channelId + '&key=' + process.env.YOUTUBE_API_KEY + '&part=id';
 
-	if(nextPageToken){
-		uri += '&pageToken=' + nextPageToken;
+	if(pageToken){
+		uri += '&pageToken=' + pageToken;
 	}
 
-	async.waterfall([
-		(next) => {
-			request.get({ uri: uri, json: true }, (err, response, body) => {
-				if(err){
-					console.error(err);
-					return;
-				}
-
-				let videoIds = body.items.filter(item => item.id.kind == 'youtube#video').map(item => item.id.videoId);
-
-				next(null, videoIds, body.nextPageToken);
-			});
-		},
-		(videoIds, nextPageToken, next)=>{
-			getVideoViewCount(videoIds, () => {
-				next(null, nextPageToken);
-			});
-		},
-		(nextPageToken) => {
-			if(!nextPageToken){
-				callback();
+	return new Promise((resolve) => {
+		request.get({ uri: uri, json: true }, (err, response, body) => {
+			if(err){
+				console.error(err);
 				return;
 			}
 
-			serachVideos(channelId, nextPageToken, callback);
-		}
-	]);
-};
+			if(!body){
+				console.error('unexpected body ' + body + '.');
+			}
 
+			if(!body.items){
+				console.error('unexpected items ' + body.items + '.');
+			}
 
-const getVideoViewCount = (videoIds, callback) => {
-	let funcs = [];
+			let videoIds = body.items.filter(item => item.id.kind == 'youtube#video').map(item => item.id.videoId);
 
-	for(let i in videoIds){
-		const videoId= videoIds[i];
-		funcs.push((next) => {
-			const uri = 'https://www.googleapis.com/youtube/v3/videos?id=' + videoId + '&key=' + process.env.YOUTUBE_API_KEY + '&part=snippet,statistics';
-			console.log('get video:', videoId);
-			request.get({ uri: uri, json: true }, (err, response, body) => {
-				if(err){
-					console.error(err);
-					return;
-				}
-
-				//const date = new Date();
-				const item = {
-					VideoId: videoId,
-					PublishedAt: body.items[0].snippet.publishedAt,
-					VideoTitle: body.items[0].snippet.title,
-					//ChannelId: body.items[0].snippet.channelId,
-					ChannelTitle: body.items[0].snippet.channelTitle,
-					ViewCount: body.items[0].statistics.viewCount,
-					LikeCount: body.items[0].statistics.likeCount | 0,
-					DislikeCount: body.items[0].statistics.dislikeCount | 0,
-					Thumbnail: '=IMAGE("' + body.items[0].snippet.thumbnails.medium.url + '")'
-				};
-
-				next(null, item);
-			});
+			resolve({videoIds: videoIds, nextPageToken: body.nextPageToken});
 		});
+	});
+}
 
-		funcs.push((item, next) => {
-			const params = {
-				TableName: 'YoutubeVideo', // DynamoDBのテーブル名
-				Key: {
-					VideoId: item.VideoId,
-				},
-				ExpressionAttributeNames: {
-					'#pa': 'PublishedAt',
-					'#vt': 'VideoTitle',
-					'#ct': 'ChannelTitle',
-					'#vc': 'ViewCount',
-					'#lc': 'LikeCount',
-					'#dc': 'DislikeCount',
-					'#th': 'Thumbnail'
-				},
-				ExpressionAttributeValues: {
-					':pa': item.PublishedAt,
-					':vt': item.VideoTitle,
-					':ct': item.ChannelTitle,
-					':vc': item.ViewCount,
-					':lc': item.LikeCount,
-					':dc': item.DislikeCount,
-					':th': item.Thumbnail
-				},
-				UpdateExpression: 'set #pa = :pa, #vt = :vt, #ct = :ct, #vc = :vc, #lc = :lc, #dc = :dc, #th = :th',
-				Item: item
+
+const getVideoIds = async (channelId) => {
+	let videoIds = [];
+	let nextPageToken = null;
+
+	do{
+		const pageInfo = await getVideoIdsOnPage(channelId, nextPageToken)
+		videoIds = videoIds.concat(pageInfo.videoIds);
+		nextPageToken = pageInfo.nextPageToken;
+	}while(nextPageToken)
+
+	return new Promise(resolve => {
+		resolve(videoIds);
+	});
+}
+
+
+const getVideoInfo = videoId => {
+	const uri = 'https://www.googleapis.com/youtube/v3/videos?id=' + videoId + '&key=' + process.env.YOUTUBE_API_KEY + '&part=snippet,statistics';
+	console.log('get video:', videoId);
+
+	return new Promise(resolve => {
+		request.get({ uri: uri, json: true }, (err, response, body) => {
+			if(err){
+				console.error(err);
+				return;
+			}
+
+			//const date = new Date();
+			const videoInfo = {
+				VideoId: videoId,
+				PublishedAt: body.items[0].snippet.publishedAt,
+				VideoTitle: body.items[0].snippet.title,
+				//ChannelId: body.items[0].snippet.channelId,
+				ChannelTitle: body.items[0].snippet.channelTitle,
+				ViewCount: body.items[0].statistics.viewCount,
+				LikeCount: body.items[0].statistics.likeCount | 0,
+				DislikeCount: body.items[0].statistics.dislikeCount | 0,
+				Thumbnail: '=IMAGE("' + body.items[0].snippet.thumbnails.medium.url + '")'
 			};
 
-			console.log('update: ', item);
-
-			dynamoDB.update(params, (err) => {
-				if(err){
-					console.error(err);
-					return;
-				}
-
-				next(null);
-			});
+			resolve(videoInfo);
 		});
-	}
-
-	funcs.push(() => {
-		callback();
 	});
-
-	async.waterfall(funcs);
-};
+}
 
 
-const getChannelIds = (callback) => {
+const updateVideoInfo = videoInfo => {
 	const params = {
-		TableName : 'Channel',
+		TableName: 'YoutubeVideo', // DynamoDBのテーブル名
+		Key: {
+			VideoId: videoInfo.VideoId,
+		},
+		ExpressionAttributeNames: {
+			'#pa': 'PublishedAt',
+			'#vt': 'VideoTitle',
+			'#ct': 'ChannelTitle',
+			'#vc': 'ViewCount',
+			'#lc': 'LikeCount',
+			'#dc': 'DislikeCount',
+			'#th': 'Thumbnail'
+		},
+		ExpressionAttributeValues: {
+			':pa': videoInfo.PublishedAt,
+			':vt': videoInfo.VideoTitle,
+			':ct': videoInfo.ChannelTitle,
+			':vc': videoInfo.ViewCount,
+			':lc': videoInfo.LikeCount,
+			':dc': videoInfo.DislikeCount,
+			':th': videoInfo.Thumbnail
+		},
+		UpdateExpression: 'set #pa = :pa, #vt = :vt, #ct = :ct, #vc = :vc, #lc = :lc, #dc = :dc, #th = :th',
+		Item: videoInfo
 	};
 
-	dynamoDB.scan(params, function(err, data) {
-		if (err){
-			console.error(err);
-			return;
-		}
+	console.log('update: ', videoInfo);
 
-		callback(data.Items);
+	return new Promise(resolve => {
+		dynamoDB.update(params, (err) => {
+			if(err){
+				console.error(err);
+				return;
+			}
+
+			resolve();
+		});
+
+		/* for debug */
+		/* setTimeout(() => {
+			console.log('dynamoDB update.')
+			resolve();
+		}, 50); */
+	});
+}
+
+
+const updateChannelRecords = async (channelId) => {
+	console.log('search videos:', channelId);
+
+	const videoIds = await getVideoIds(channelId);
+
+	for(let videoId of videoIds){
+		const videoInfo = await getVideoInfo(videoId);
+		await updateVideoInfo(videoInfo);
+	}
+
+	return new Promise(resolve => {
+		resolve();
 	});
 };
 
 
-exports.handler = (event, context, callback) => {
-	getChannelIds((items)=>{
-		let funcs = [];
-		const date = new Date();
-		const hour = date.getHours();
-		const minute = date.getMinutes();
+const getChannelIds = () => {
+	return new Promise(resolve => {
+		dynamoDB.scan({TableName : 'Channel'}, function(err, data) {
+			if (err){
+				console.error(err);
+				return;
+			}
 
-		for(let i in items){
-			if(i % 36 != (hour * 6 + parseInt(minute / 10)) % 36) continue;
-			const channelId = items[i].ChannelId;
-			funcs.push((next) => {
-				serachVideos(channelId, null, () => {
-					next();
-				});
-			});
-		}
+			const channelIds = [];
 
-		funcs.push(() => {
-			callback();
+			for(let item of data.Items){
+				channelIds.push(item.ChannelId);
+			}
+
+			resolve(channelIds);
 		});
 
-		async.series(funcs);
+		/* for debug */
+		/* setTimeout(() => {
+			console.log('dynamoDB update.')
+			resolve(['UCsdLjPRxv5yz8EiAdRMQ2KQ', 'UC1ulyJlOkUQjSB3FyFksmhQ']);
+		}, 50); */
 	});
+};
+
+
+exports.handler = async (event, context, callback) => {
+	const channelIds = await getChannelIds();
+
+	const date = new Date();
+	const hour = date.getHours();
+	const minute = date.getMinutes();
+
+	for(let i in channelIds){
+		if(i % 36 != (hour * 6 + parseInt(minute / 10)) % 36) continue;
+		await updateChannelRecords(channelIds[i], null);
+	}
+
+	callback();
 }
